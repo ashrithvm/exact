@@ -34,7 +34,9 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake/Modules/
 
 message (STATUS "CMAKE_MODULE_PATH is ${CMAKE_MODULE_PATH}")
 
-find_package(MPI)
+if (NOT MPI_FOUND)
+    find_package(MPI)
+endif()
 #SET(MPI_INCLUDE_PATH /usr/local/Cellar/open-mpi/3.1.2/include)
 #SET(MPI_INCLUDE_PATH /usr/local/Cellar/open-mpi/4.0.0/include)
 SET(MPI_INCLUDE_PATH /usr/local/Cellar/open-mpi/4.0.1/include)

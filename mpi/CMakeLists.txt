@@ -1,7 +1,9 @@
 add_executable(process_sweep_results tracker.cxx run_statistics.cxx process_sweep_results.cxx)
 target_link_libraries(process_sweep_results examm_strategy exact_common exact_time_series exact_weights examm_nn  pthread)
 
-find_package(MPI)
+if (NOT MPI_FOUND)
+    find_package(MPI)
+endif()
 
 if (MPI_FOUND)
     set (CMAKE_CXX_COMPILE_FLAGS "${CMAKE_COMPILE_FLAGS} ${MPI_COMPILE_FLAGS}")
