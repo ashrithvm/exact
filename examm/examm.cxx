@@ -278,6 +278,11 @@ string EXAMM::get_output_directory() const {
     return output_directory;
 }
 
+void EXAMM::set_innovation_offsets(int32_t edge_offset, int32_t node_offset) {
+    edge_innovation_count += edge_offset;
+    node_innovation_count += node_offset;
+}
+
 double EXAMM::get_best_fitness() {
     return speciation_strategy->get_best_fitness();
 }

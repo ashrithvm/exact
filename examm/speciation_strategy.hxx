@@ -11,6 +11,8 @@ using std::uniform_real_distribution;
 
 class SpeciationStrategy {
    public:
+    virtual ~SpeciationStrategy() = default;
+
         /**
      * \return the number of generated genomes.
      */

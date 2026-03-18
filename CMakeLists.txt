@@ -122,6 +122,7 @@ add_subdirectory(examm)
 # add_subdirectory(cnn_examples)
 add_subdirectory(multithreaded)
 add_subdirectory(mpi)
+add_subdirectory(p2p)
 
 # add_subdirectory(exona)
 

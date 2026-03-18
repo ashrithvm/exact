@@ -152,6 +152,8 @@ class EXAMM {
 
     string get_output_directory() const;
 
+    void set_innovation_offsets(int32_t edge_offset, int32_t node_offset);
+
     void check_weight_initialize_validity();
     void generate_log();
     void set_evolution_hyper_parameters();

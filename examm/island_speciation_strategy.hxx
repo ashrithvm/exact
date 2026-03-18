@@ -203,7 +203,7 @@ class IslandSpeciationStrategy : public SpeciationStrategy {
         function<void(int32_t, RNN_Genome*)>& mutate, function<RNN_Genome*(RNN_Genome*, RNN_Genome*)>& crossover
     );
 
-    RNN_Genome* generate_for_filled_island(
+    virtual RNN_Genome* generate_for_filled_island(
         uniform_real_distribution<double>& rng_0_1, minstd_rand0& generator,
         function<void(int32_t, RNN_Genome*)>& mutate, function<RNN_Genome*(RNN_Genome*, RNN_Genome*)>& crossover
     );
@@ -211,7 +211,7 @@ class IslandSpeciationStrategy : public SpeciationStrategy {
         uniform_real_distribution<double>& rng_0_1, minstd_rand0& generator,
         function<void(int32_t, RNN_Genome*)>& mutate
     );
-    RNN_Genome* generate_for_repopulating_island(
+    virtual RNN_Genome* generate_for_repopulating_island(
         uniform_real_distribution<double>& rng_0_1, minstd_rand0& generator,
         function<void(int32_t, RNN_Genome*)>& mutate, function<RNN_Genome*(RNN_Genome*, RNN_Genome*)>& crossover
     );
@@ -297,6 +297,18 @@ class IslandSpeciationStrategy : public SpeciationStrategy {
     void repopulate();
 
     void save_entire_population(string output_path);
+
+    // Accessors for P2P subclass
+    Island* get_island_by_index(int32_t index) { return islands[index]; }
+    int32_t get_number_of_islands() const { return number_of_islands; }
+    int32_t get_generation_island() const { return generation_island; }
+    double get_mutation_rate() const { return mutation_rate; }
+    double get_intra_island_crossover_rate() const { return intra_island_crossover_rate; }
+    double get_inter_island_crossover_rate() const { return inter_island_crossover_rate; }
+    int32_t get_is_sweet() const { return is_sweet; }
+    int32_t get_is_harada_selection() const { return is_harada_selection; }
+    double get_harada_selection_ratio() const { return harada_selection_ratio; }
+    int32_t get_num_mutations() const { return num_mutations; }
 };
 
 #endif
