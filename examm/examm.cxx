@@ -370,6 +370,16 @@ bool EXAMM::insert_genome(RNN_Genome* genome) {
     return insert_position >= 0;
 }
 
+bool EXAMM::inject_migrated_genome(RNN_Genome* genome) {
+    // Migrated/backup genomes are expected to be fully evaluated already.
+    // We therefore insert them directly and intentionally do not touch the
+    // local SWEET evaluating pool.
+    //
+    // `insert_genome` copies the genome internally, and the caller retains
+    // ownership of `genome` (and should delete it).
+    return insert_genome(genome);
+}
+
 void EXAMM::add_evaluating_genome(RNN_Genome* genome) {
     speciation_strategy->add_evaluating_genome(genome);
 }

@@ -124,6 +124,11 @@ class EXAMM {
 
     RNN_Genome* generate_genome();
     bool insert_genome(RNN_Genome* genome);
+    // Insert a genome produced by a different peer (migrated/backup).
+    // This is functionally similar to `insert_genome`, but exists to make the P2P
+    // call site intent explicit and to decouple centralized master/worker logic.
+    // Caller retains ownership of `genome` and should delete it after the call.
+    bool inject_migrated_genome(RNN_Genome* genome);
 
     void mutate(int32_t max_mutations, RNN_Genome* p1);
 
