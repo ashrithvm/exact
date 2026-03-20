@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdint>
 #include <stdexcept>
 using std::runtime_error;
 
