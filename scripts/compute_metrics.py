@@ -46,13 +46,6 @@ def compute_metrics(csv_path):
     improvement = (initial_mse - best_mse) / initial_mse * 100
     print(f"MSE Improvement: {improvement:.1f}% from initial to final")
 
-    # Benchmark comparison notes
-    print("\n=== Benchmark Comparison Notes ===")
-    print("- MSE ~0.004 is excellent for multivariate time series forecasting")
-    print("- Compare to M4 competition: top models ~0.01-0.05 MSE")
-    print("- For flight data (NGAFID): typical LSTM/GRU MSE ~0.01-0.1")
-    print("- Baseline suggestion: Train a simple linear regression on same data")
-    print("  Expected baseline MSE: ~0.02-0.05 (if your model beats this, it's good)")
 
 if __name__ == "__main__":
     import argparse
