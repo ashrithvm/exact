@@ -149,6 +149,7 @@ class EXAMM {
     double get_worst_fitness();
     RNN_Genome* get_best_genome();
     RNN_Genome* get_worst_genome();
+    std::vector<RNN_Genome*> get_top_genomes(int32_t k);
 
     void save_visualization_json(RNN_Genome* genome, string genome_name);
     void save_genome(RNN_Genome* genome, string genome_name);

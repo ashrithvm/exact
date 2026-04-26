@@ -294,6 +294,12 @@ RNN_Genome* EXAMM::get_worst_genome() {
     return speciation_strategy->get_worst_genome();
 }
 
+std::vector<RNN_Genome*> EXAMM::get_top_genomes(int32_t k) {
+    auto* island_strat = dynamic_cast<IslandSpeciationStrategy*>(speciation_strategy);
+    if (island_strat == nullptr) return {};
+    return island_strat->get_top_genomes(k);
+}
+
 // this will insert a COPY, original needs to be deleted
 bool EXAMM::insert_genome(RNN_Genome* genome) {
     // discard genomes with NaN fitness

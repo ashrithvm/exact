@@ -65,6 +65,10 @@ IslandSpeciationStrategy::IslandSpeciationStrategy(
     seed_genome->set_generation_id(generated_genomes);
     global_best_genome = NULL;
 
+    // Top-k snapshot cache: size = one full island.  Snapshot interval is
+    // governed by the P2P layer; we just keep the buffer fresh on every insert.
+    top_k_size = max_island_size;
+
     Log::info("Speciation method is: island (Default is the island-based speciation strategy).\n");
     Log::info("Island Strategy: Number of mutations is set to %d\n", num_mutations);
     if (extinction_event_generation_number > 0) {
@@ -115,6 +119,41 @@ int32_t IslandSpeciationStrategy::get_evaluated_genomes() const {
 RNN_Genome* IslandSpeciationStrategy::get_best_genome() {
     // the global_best_genome is updated every time a genome is inserted
     return global_best_genome;
+}
+
+std::vector<RNN_Genome*> IslandSpeciationStrategy::get_top_genomes(int32_t k) {
+    // Returns up to k pointers from the maintained top-k cache (sorted best-first).
+    // Pointers are owned by this strategy; caller must not delete them.
+    std::vector<RNN_Genome*> out;
+    int32_t take = std::min<int32_t>(k, (int32_t) top_k_cache.size());
+    out.reserve(take);
+    for (int32_t i = 0; i < take; i++) out.push_back(top_k_cache[i]);
+    return out;
+}
+
+void IslandSpeciationStrategy::update_top_k_cache(RNN_Genome* candidate) {
+    // O(k) maintenance: insert in sorted position if the candidate qualifies.
+    // Stores a copy so the cache outlives island evictions.
+    if (candidate == nullptr) return;
+    if (std::isnan(candidate->get_fitness()) || std::isinf(candidate->get_fitness())) return;
+
+    const double cand_fit = candidate->get_fitness();
+    if ((int32_t) top_k_cache.size() >= top_k_size
+            && cand_fit >= top_k_cache.back()->get_fitness()) {
+        return;  // not better than the current worst-in-cache; skip.
+    }
+
+    RNN_Genome* copy = candidate->copy();
+    auto pos = std::upper_bound(top_k_cache.begin(), top_k_cache.end(), copy,
+        [](const RNN_Genome* a, const RNN_Genome* b) {
+            return a->get_fitness() < b->get_fitness();
+        });
+    top_k_cache.insert(pos, copy);
+
+    if ((int32_t) top_k_cache.size() > top_k_size) {
+        delete top_k_cache.back();
+        top_k_cache.pop_back();
+    }
 }
 
 RNN_Genome* IslandSpeciationStrategy::get_worst_genome() {
@@ -199,6 +238,11 @@ int32_t IslandSpeciationStrategy::insert_genome(RNN_Genome* genome) {
     }
     int32_t insert_position = islands[island]->insert_genome(genome);
     Log::info("Island %d: Insert position was: %d\n", island, insert_position);
+
+    // Maintain top-k cache for P2P snapshot backup (only on successful insert).
+    if (insert_position >= 0) {
+        update_top_k_cache(genome);
+    }
 
     if (insert_position == 0) {
         if (new_global_best) {

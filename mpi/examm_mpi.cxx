@@ -5,7 +5,10 @@ using std::setprecision;
 using std::setw;
 
 #include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <algorithm>
+#include <map>
 #include <numeric>
 #include <fstream>
 #include <sstream>
@@ -69,6 +72,16 @@ using std::vector;
 // Intentional/graceful shutdown: rank broadcasts before permanently leaving.
 // Payload: 1 x MPI_INT = shutting-down rank id.
 #define GRACEFUL_SHUTDOWN_TAG 15
+
+// Periodic top-k snapshot pushed from a rank to its ring successor.
+// Length tag carries one int32 = total bytes of the encoded blob.
+// Data tag carries the chunked blob:
+//     [int32 num_genomes][int32 g1_len][g1_bytes][int32 g2_len][g2_bytes]...
+// Successor stores latest snapshot per source rank in peer_snapshots.
+// On PEER_FAILED, successor adopts those genomes into its own EXAMM.
+// On REJOIN_REQUEST, successor returns the rejoiner's own snapshot if held.
+#define SNAPSHOT_LENGTH_TAG  16
+#define SNAPSHOT_DATA_TAG    17
 
 mutex examm_mutex;
 
@@ -183,6 +196,12 @@ struct DropoutConfig {
     // Heartbeat tuning.
     int32_t heartbeat_interval_ms   = 1000; // how often each rank pings its successor
     int32_t heartbeat_timeout_ms    = 5000; // silence before successor declares failure
+
+    // Snapshot tuning: how often each rank pushes its top-k cache to its ring
+    // successor.  Successor uses the latest snapshot to (a) adopt the population
+    // when the source is declared failed, (b) seed the source on REJOIN.
+    // 0 disables periodic snapshots.
+    int32_t snapshot_interval_ms    = 10000;
 };
 
 enum class GenomeTransferKind : int32_t {
@@ -304,6 +323,216 @@ static void cancel_and_free_small(std::vector<SmallOutgoing>& v) {
     v.clear();
 }
 
+// =====================================================================
+// Snapshot transfer (P2P top-k backup)
+// =====================================================================
+// Wire format of an encoded snapshot blob:
+//   [int32 num_genomes]
+//   [int32 g1_len][g1_bytes]
+//   [int32 g2_len][g2_bytes]
+//   ...
+// Sender owns the encoded blob until MPI completes; receiver buffers the
+// raw bytes and stores them by source rank for later adoption / rejoin.
+
+struct OutgoingSnapshotTransfer {
+    int32_t dest = -1;
+    int32_t length = 0;
+    char* byte_array = nullptr;       // malloc'd encoded snapshot blob
+    int32_t* length_ptr = nullptr;
+    std::vector<MPI_Request> requests;
+};
+
+struct IncomingSnapshotTransfer {
+    int32_t source = -1;
+    int32_t length = 0;
+    char* buffer = nullptr;
+    std::vector<MPI_Request> requests;
+};
+
+// Encode a vector of genomes into a single contiguous byte buffer (malloc'd).
+// Returns nullptr if no genomes were given.
+static char* encode_snapshot(const std::vector<RNN_Genome*>& genomes, int32_t& out_length) {
+    int32_t num = (int32_t) genomes.size();
+    std::vector<std::pair<char*, int32_t>> serialized;
+    serialized.reserve(num);
+
+    int32_t total = (int32_t) sizeof(int32_t);  // num header
+    for (RNN_Genome* g : genomes) {
+        char* bytes = nullptr;
+        int32_t len = 0;
+        g->write_to_array(&bytes, len);
+        serialized.emplace_back(bytes, len);
+        total += (int32_t) sizeof(int32_t) + len;
+    }
+
+    char* blob = (char*) malloc(total);
+    int32_t offset = 0;
+    std::memcpy(blob + offset, &num, sizeof(int32_t));
+    offset += (int32_t) sizeof(int32_t);
+    for (auto& s : serialized) {
+        std::memcpy(blob + offset, &s.second, sizeof(int32_t));
+        offset += (int32_t) sizeof(int32_t);
+        std::memcpy(blob + offset, s.first, s.second);
+        offset += s.second;
+        free(s.first);
+    }
+
+    out_length = total;
+    return blob;
+}
+
+// Decode a snapshot blob into newly-allocated RNN_Genome instances.
+// Caller owns and must delete every returned genome.
+static std::vector<RNN_Genome*> decode_snapshot(const char* blob, int32_t length) {
+    std::vector<RNN_Genome*> out;
+    if (blob == nullptr || length < (int32_t) sizeof(int32_t)) return out;
+    int32_t offset = 0;
+    int32_t num = 0;
+    std::memcpy(&num, blob + offset, sizeof(int32_t));
+    offset += (int32_t) sizeof(int32_t);
+    for (int32_t i = 0; i < num && offset + (int32_t) sizeof(int32_t) <= length; i++) {
+        int32_t glen = 0;
+        std::memcpy(&glen, blob + offset, sizeof(int32_t));
+        offset += (int32_t) sizeof(int32_t);
+        if (glen <= 0 || offset + glen > length) break;
+        // RNN_Genome(char*, int32_t) constructor consumes a writable buffer.
+        std::vector<char> tmp(blob + offset, blob + offset + glen);
+        out.push_back(new RNN_Genome(tmp.data(), glen));
+        offset += glen;
+    }
+    return out;
+}
+
+static void queue_snapshot_send(
+    int32_t dest,
+    const std::vector<RNN_Genome*>& genomes,
+    std::vector<OutgoingSnapshotTransfer>& pending
+) {
+    constexpr int32_t chunk_size = 32768;
+
+    int32_t length = 0;
+    char* blob = encode_snapshot(genomes, length);
+    if (blob == nullptr || length <= 0) {
+        if (blob) free(blob);
+        return;
+    }
+
+    int32_t* length_ptr = new int32_t(length);
+    OutgoingSnapshotTransfer t;
+    t.dest = dest;
+    t.length = length;
+    t.byte_array = blob;
+    t.length_ptr = length_ptr;
+    t.requests.reserve(1 + (length + chunk_size - 1) / chunk_size);
+
+    MPI_Request len_req;
+    MPI_Isend(length_ptr, 1, MPI_INT, dest, SNAPSHOT_LENGTH_TAG, MPI_COMM_WORLD, &len_req);
+    t.requests.push_back(len_req);
+
+    int32_t offset = 0;
+    while (offset < length) {
+        int32_t send_size = length - offset;
+        if (send_size > chunk_size) send_size = chunk_size;
+        MPI_Request req;
+        MPI_Isend(blob + offset, send_size, MPI_CHAR, dest, SNAPSHOT_DATA_TAG, MPI_COMM_WORLD, &req);
+        t.requests.push_back(req);
+        offset += send_size;
+    }
+
+    pending.push_back(std::move(t));
+}
+
+static void post_snapshot_receive(
+    int32_t source,
+    int32_t length,
+    std::vector<IncomingSnapshotTransfer>& pending
+) {
+    constexpr int32_t chunk_size = 32768;
+
+    IncomingSnapshotTransfer t;
+    t.source = source;
+    t.length = length;
+    t.buffer = new char[length];
+    t.requests.reserve((length + chunk_size - 1) / chunk_size);
+
+    int32_t offset = 0;
+    while (offset < length) {
+        int32_t recv_size = length - offset;
+        if (recv_size > chunk_size) recv_size = chunk_size;
+        MPI_Request req;
+        MPI_Irecv(t.buffer + offset, recv_size, MPI_CHAR, source, SNAPSHOT_DATA_TAG,
+                  MPI_COMM_WORLD, &req);
+        t.requests.push_back(req);
+        offset += recv_size;
+    }
+
+    pending.push_back(std::move(t));
+}
+
+static void progress_outgoing_snapshots(std::vector<OutgoingSnapshotTransfer>& pending) {
+    for (size_t i = 0; i < pending.size();) {
+        auto& t = pending[i];
+        if (t.requests.empty()) {
+            if (t.byte_array) free(t.byte_array);
+            if (t.length_ptr) delete t.length_ptr;
+            pending.erase(pending.begin() + i);
+            continue;
+        }
+        int flag = 0;
+        int rc = MPI_Testall((int) t.requests.size(), t.requests.data(), &flag, MPI_STATUSES_IGNORE);
+        if (flag || rc != MPI_SUCCESS) {
+            if (t.byte_array) free(t.byte_array);
+            if (t.length_ptr) delete t.length_ptr;
+            pending.erase(pending.begin() + i);
+        } else {
+            i++;
+        }
+    }
+}
+
+// On completion, move the received bytes into peer_snapshots[source], replacing
+// any prior snapshot from that source.  Genomes are not deserialized here —
+// adoption / rejoin paths do that lazily.
+static void progress_incoming_snapshots(
+    std::vector<IncomingSnapshotTransfer>& pending,
+    std::map<int32_t, std::vector<char>>& peer_snapshots
+) {
+    for (size_t i = 0; i < pending.size();) {
+        auto& t = pending[i];
+        if (t.requests.empty()) {
+            delete[] t.buffer;
+            pending.erase(pending.begin() + i);
+            continue;
+        }
+        int flag = 0;
+        int rc = MPI_Testall((int) t.requests.size(), t.requests.data(), &flag, MPI_STATUSES_IGNORE);
+        if (!flag && rc == MPI_SUCCESS) { i++; continue; }
+
+        if (rc == MPI_SUCCESS) {
+            peer_snapshots[t.source].assign(t.buffer, t.buffer + t.length);
+        }
+        delete[] t.buffer;
+        pending.erase(pending.begin() + i);
+    }
+}
+
+static void cancel_and_free_outgoing_snapshots(std::vector<OutgoingSnapshotTransfer>& v) {
+    for (auto& t : v) {
+        for (auto& r : t.requests) { MPI_Cancel(&r); MPI_Wait(&r, MPI_STATUS_IGNORE); }
+        if (t.byte_array) free(t.byte_array);
+        if (t.length_ptr) delete t.length_ptr;
+    }
+    v.clear();
+}
+
+static void cancel_and_free_incoming_snapshots(std::vector<IncomingSnapshotTransfer>& v) {
+    for (auto& t : v) {
+        for (auto& r : t.requests) { MPI_Cancel(&r); MPI_Wait(&r, MPI_STATUS_IGNORE); }
+        delete[] t.buffer;
+    }
+    v.clear();
+}
+
 static void post_genome_receive(
     GenomeTransferKind kind,
     int32_t source,
@@ -352,8 +581,9 @@ static void progress_outgoing(
         }
 
         int flag = 0;
-        MPI_Testall((int) t.requests.size(), t.requests.data(), &flag, MPI_STATUSES_IGNORE);
-        if (flag) {
+        int rc = MPI_Testall((int) t.requests.size(), t.requests.data(), &flag, MPI_STATUSES_IGNORE);
+        // Remove on completion OR on error (e.g. dead destination after a hard crash).
+        if (flag || rc != MPI_SUCCESS) {
             if (t.byte_array) free(t.byte_array);
             if (t.length_ptr) delete t.length_ptr;
             pending_outgoing.erase(pending_outgoing.begin() + i);
@@ -884,6 +1114,12 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     std::vector<IncomingGenomeTransfer> pending_incoming;
     std::vector<OutgoingGenomeTransfer> pending_outgoing;
     std::vector<SmallOutgoing>          small_pending;   // non-blocking pool for control msgs
+    std::vector<OutgoingSnapshotTransfer> pending_outgoing_snapshots;
+    std::vector<IncomingSnapshotTransfer> pending_incoming_snapshots;
+    // Latest snapshot bytes received from each source rank.  Replaced on each
+    // new snapshot from the same source.  Consumed on PEER_FAILED (adoption)
+    // and on REJOIN_REQUEST (return-to-sender).
+    std::map<int32_t, std::vector<char>> peer_snapshots;
     constexpr size_t MAX_PENDING_TRANSFERS = 8;
 
     // Return error codes instead of aborting when a transport disconnect occurs.
@@ -934,6 +1170,13 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     bool token_ever_seen   = false;
     const auto TOKEN_TIMEOUT = std::chrono::milliseconds(dropout_cfg.heartbeat_timeout_ms * 2);
 
+    // ----- Snapshot push timer -----
+    // Each rank periodically pushes its top-k cache to its ring successor so
+    // the successor has a recent backup of this rank's genetic material.
+    auto last_snapshot_sent = start_time;
+    const auto snapshot_interval = std::chrono::milliseconds(dropout_cfg.snapshot_interval_ms);
+    const bool snapshots_enabled = (dropout_cfg.snapshot_interval_ms > 0 && max_rank > 1);
+
     // Token fields: [0]=origin_rank [1]=hop_count [2]=done_count [3]=final_flag
     if (rank == 0 && max_rank > 1) {
         int32_t token[4] = {0, 0, 0, 0};
@@ -967,6 +1210,8 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             cancel_and_free_outgoing(pending_outgoing);
             cancel_and_free_incoming(pending_incoming);
             cancel_and_free_small(small_pending);
+            cancel_and_free_outgoing_snapshots(pending_outgoing_snapshots);
+            cancel_and_free_incoming_snapshots(pending_incoming_snapshots);
 
             is_hard_crashed      = true;
             hard_crash_triggered = true;
@@ -1008,11 +1253,14 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 predecessor_declared_dead = false;
                 last_heartbeat_from_pred  = now;
 
+                // Target the original ring successor — that peer holds our last
+                // periodic snapshot and can return our pre-crash population.
                 if (!active_ranks.empty()) {
-                    isend_small(&rank, 1, active_ranks[0], REJOIN_REQUEST_TAG, small_pending);
+                    int32_t target = ring_successor;
+                    isend_small(&rank, 1, target, REJOIN_REQUEST_TAG, small_pending);
                     Log::info("[HARD_CRASH_REJOIN] t=%.1fs  rank %d waking up. "
-                              "Sent REJOIN_REQUEST to rank %d.\n",
-                              elapsed_s, rank, active_ranks[0]);
+                              "Sent REJOIN_REQUEST to rank %d (snapshot holder).\n",
+                              elapsed_s, rank, target);
                 }
 
                 ft_log.log("HARD_CRASH_REJOIN_REQUESTED", rank, active_ranks.size(),
@@ -1040,15 +1288,15 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             && elapsed_s >= dropout_cfg.dropout_after_seconds
             && !local_done)
         {
-            // Flush best genome to successor before going dark (last known-good state).
-            const int32_t backup_succ = next_alive_rank(rank, active_ranks);
-            RNN_Genome*   best        = examm->get_best_genome();
-            if (best != nullptr && backup_succ != rank
-                && pending_outgoing.size() < MAX_PENDING_TRANSFERS)
-            {
-                queue_genome_send(GenomeTransferKind::BACKUP, backup_succ, best, pending_outgoing);
-                while (!pending_outgoing.empty()) {
-                    progress_outgoing(pending_outgoing);
+            // Voluntary pause: push final top-k snapshot to ring successor so
+            // it has the latest state to (a) adopt while we're silent and
+            // (b) hand back to us on recovery.
+            std::vector<RNN_Genome*> top = examm->get_top_genomes(/*k*/ 32);
+            if (!top.empty() && std::find(active_ranks.begin(), active_ranks.end(),
+                                          ring_successor) != active_ranks.end()) {
+                queue_snapshot_send(ring_successor, top, pending_outgoing_snapshots);
+                while (!pending_outgoing_snapshots.empty()) {
+                    progress_outgoing_snapshots(pending_outgoing_snapshots);
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
@@ -1087,13 +1335,27 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         {
             Log::info("[SHUTDOWN] t=%.1fs  rank %d initiating graceful shutdown.\n", elapsed_s, rank);
 
-            // Send best genome to ALL active peers so no work is lost.
+            // Push final top-k snapshot synchronously to the ring successor so
+            // it can adopt our full population (not just our single best).
+            // This is the soft-drop "distribute before leaving" path.
+            std::vector<RNN_Genome*> top = examm->get_top_genomes(/*k*/ 32);
+            if (!top.empty() && std::find(active_ranks.begin(), active_ranks.end(),
+                                          ring_successor) != active_ranks.end()) {
+                queue_snapshot_send(ring_successor, top, pending_outgoing_snapshots);
+                Log::info("[SHUTDOWN] rank %d pushed final snapshot of %zu genome(s) to rank %d.\n",
+                          rank, top.size(), ring_successor);
+                while (!pending_outgoing_snapshots.empty()) {
+                    progress_outgoing_snapshots(pending_outgoing_snapshots);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+
+            // Also broadcast best genome to all peers as a redundancy in case
+            // the successor itself crashes immediately after.
             RNN_Genome* best = examm->get_best_genome();
             if (best != nullptr) {
                 for (int32_t r : active_ranks) {
                     if (r != rank && pending_outgoing.size() < MAX_PENDING_TRANSFERS) {
-                        Log::info("[SHUTDOWN] rank %d sending best genome (fitness=%.6f) to rank %d\n",
-                                  rank, best->get_fitness(), r);
                         queue_genome_send(GenomeTransferKind::BACKUP, r, best, pending_outgoing);
                     }
                 }
@@ -1149,11 +1411,13 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             is_dropped  = false;   // resume heartbeats
             local_done  = false;   // will be re-enabled once REJOIN_NOTIFY arrives
 
-            // Request genome seed from the lowest active rank.
+            // Target the original ring successor — that peer holds our last
+            // periodic snapshot and can return our pre-dropout population.
             if (!active_ranks.empty()) {
-                int32_t target = active_ranks[0];
+                int32_t target = ring_successor;
                 isend_small(&rank, 1, target, REJOIN_REQUEST_TAG, small_pending);
-                Log::info("[REJOIN] rank %d sent REJOIN_REQUEST to rank %d\n", rank, target);
+                Log::info("[REJOIN] rank %d sent REJOIN_REQUEST to rank %d (snapshot holder)\n",
+                          rank, target);
             }
 
             recovery_sent = true;
@@ -1178,9 +1442,37 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             }
         }
 
+        // =================================================================
+        // PERIODIC SNAPSHOT PUSH
+        // Periodically push our top-k cache to the ring successor so it can
+        // (a) adopt our population if we're declared failed, (b) seed us back
+        // on REJOIN.  Skipped while dropped/shutdown/crashed (no liveness).
+        // We push to the ring successor (physical), not next_alive_rank, so
+        // the same peer is consistently responsible across recovery cycles.
+        // =================================================================
+        if (snapshots_enabled && !is_dropped && !is_shutdown && !is_hard_crashed
+            && now - last_snapshot_sent >= snapshot_interval
+            && pending_outgoing_snapshots.size() < MAX_PENDING_TRANSFERS)
+        {
+            std::vector<RNN_Genome*> top = examm->get_top_genomes(/*k*/ 32);
+            if (!top.empty()) {
+                queue_snapshot_send(ring_successor, top, pending_outgoing_snapshots);
+                last_sent_to_succ  = now;   // counts as liveness toward successor
+                last_snapshot_sent = now;
+                ft_log.log("SNAPSHOT_SENT", ring_successor, active_ranks.size(),
+                           examm->get_best_fitness(),
+                           (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
+                           -1.0,
+                           "k=" + std::to_string(top.size()));
+            } else {
+                last_snapshot_sent = now;  // skip until next interval
+            }
+        }
+
         // Progress background transfers.
         progress_outgoing(pending_outgoing);
         progress_incoming(pending_incoming, examm, rank, active_ranks);
+        progress_outgoing_snapshots(pending_outgoing_snapshots);
         drain_small_pool(small_pending);
 
         // =================================================================
@@ -1201,6 +1493,29 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 if (pred_active) {
                     last_heartbeat_from_pred  = now;
                     predecessor_declared_dead = false;
+                } else {
+                    // Resurrection: a heartbeat from a peer we previously marked
+                    // dead means it was just slow (e.g. mid-evaluation), not
+                    // crashed.  Re-add it locally and broadcast REJOIN_NOTIFY so
+                    // every rank re-adds it to active_ranks (otherwise their
+                    // alive_count stays wrong and token consensus splits).
+                    int32_t resurrected = ring_predecessor;
+                    Log::info("[HEARTBEAT] rank %d: predecessor %d resurrected "
+                              "(heartbeat received after declared-dead).\n",
+                              rank, resurrected);
+                    active_ranks.push_back(resurrected);
+                    std::sort(active_ranks.begin(), active_ranks.end());
+                    last_heartbeat_from_pred  = now;
+                    predecessor_declared_dead = false;
+                    for (int32_t r : active_ranks) {
+                        if (r != rank && r != resurrected) {
+                            isend_small(&resurrected, 1, r, REJOIN_NOTIFY_TAG, small_pending);
+                        }
+                    }
+                    ft_log.log("PEER_RESURRECTED", resurrected, active_ranks.size(),
+                               examm->get_best_fitness(),
+                               (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
+                               -1.0, "heartbeat_after_declared_dead;broadcast_rejoin_notify");
                 }
             }
         }
@@ -1209,8 +1524,13 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         // FAILURE DETECTION
         // If predecessor heartbeat has been silent past the timeout window,
         // this rank declares it failed and broadcasts PEER_FAILED to all.
+        // Suppressed once we're locally done: at end-of-run we're just waiting
+        // for token consensus, and false positives (caused by a peer being
+        // mid-evaluation when wallclock hit) cause an active_ranks split-brain
+        // that prevents consensus.  Real failures during this window are still
+        // handled by the token-recovery path (TOKEN_TIMEOUT regeneration).
         // =================================================================
-        if (max_rank > 1 && !predecessor_declared_dead
+        if (max_rank > 1 && !predecessor_declared_dead && !local_done
             && now - start_time > hb_warmup)
         {
             bool pred_active = std::find(active_ranks.begin(), active_ranks.end(),
@@ -1279,10 +1599,30 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                         predecessor_declared_dead = true;
                     }
 
+                    // Adoption: if we hold the failed rank's last snapshot (we're
+                    // their ring successor), inject its top-k into our own EXAMM
+                    // so the population is preserved in the surviving network.
+                    // Snapshot is retained so we can send it back on REJOIN.
+                    int32_t adopted = 0;
+                    auto snap_it = peer_snapshots.find(failed_rank);
+                    if (snap_it != peer_snapshots.end() && !snap_it->second.empty()) {
+                        std::vector<RNN_Genome*> recovered =
+                            decode_snapshot(snap_it->second.data(),
+                                            (int32_t) snap_it->second.size());
+                        for (RNN_Genome* g : recovered) {
+                            examm->inject_migrated_genome(g);
+                            delete g;
+                            adopted++;
+                        }
+                        Log::info("[ADOPT] rank %d adopted %d genome(s) from failed rank %d.\n",
+                                  rank, adopted, failed_rank);
+                    }
+
                     ft_log.log("PEER_FAILED_RECEIVED", failed_rank, active_ranks.size(),
                                examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
                                -1.0,
-                               "detected_by_rank=" + std::to_string(st_pf.MPI_SOURCE));
+                               "detected_by_rank=" + std::to_string(st_pf.MPI_SOURCE)
+                               + ";adopted=" + std::to_string(adopted));
                     ft_log.on_failure(examm->get_best_fitness());
                 }
             }
@@ -1314,9 +1654,30 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                     predecessor_declared_dead = true;
                 }
 
+                // Adoption: if we hold the leaving rank's snapshot (we're its
+                // ring successor and got the final synchronous push), inject its
+                // top-k into our own EXAMM.  Graceful shutdown is permanent so
+                // we erase the snapshot — no rejoin will reclaim it.
+                int32_t adopted = 0;
+                auto snap_it = peer_snapshots.find(shutting_rank);
+                if (snap_it != peer_snapshots.end() && !snap_it->second.empty()) {
+                    std::vector<RNN_Genome*> recovered =
+                        decode_snapshot(snap_it->second.data(),
+                                        (int32_t) snap_it->second.size());
+                    for (RNN_Genome* g : recovered) {
+                        examm->inject_migrated_genome(g);
+                        delete g;
+                        adopted++;
+                    }
+                    peer_snapshots.erase(snap_it);
+                    Log::info("[ADOPT] rank %d adopted %d genome(s) from departing rank %d.\n",
+                              rank, adopted, shutting_rank);
+                }
+
                 ft_log.log("GRACEFUL_SHUTDOWN_RECEIVED", shutting_rank, active_ranks.size(),
                            examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
-                           -1.0, "permanent;genome_handoff_received");
+                           -1.0,
+                           "permanent;adopted=" + std::to_string(adopted));
                 ft_log.on_failure(examm->get_best_fitness());
 
                 Log::info("[SHUTDOWN] rank %d: %zu active peer(s) remaining.\n",
@@ -1338,13 +1699,42 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 MPI_Recv(&rejoining_rank, 1, MPI_INT, st_rr.MPI_SOURCE,
                          REJOIN_REQUEST_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-                Log::info("[REJOIN] rank %d: rank %d requesting rejoin. Seeding genome.\n",
+                Log::info("[REJOIN] rank %d: rank %d requesting rejoin.\n",
                           rank, rejoining_rank);
 
-                RNN_Genome* best = examm->get_best_genome();
-                if (best != nullptr && pending_outgoing.size() < MAX_PENDING_TRANSFERS) {
-                    queue_genome_send(GenomeTransferKind::BACKUP, rejoining_rank, best, pending_outgoing);
+                // Preferred path: return the rejoiner's own pre-failure snapshot
+                // so it recovers as much of its prior population as possible.
+                // Fallback: seed from our local top-k.
+                // Both paths send genomes as BACKUP transfers so the existing
+                // receive path on the rejoiner injects them via the normal
+                // inject_migrated_genome flow.
+                std::string seed_source;
+                int32_t seeded = 0;
+                std::vector<RNN_Genome*> to_send;
+                auto rsnap = peer_snapshots.find(rejoining_rank);
+                if (rsnap != peer_snapshots.end() && !rsnap->second.empty()) {
+                    to_send = decode_snapshot(rsnap->second.data(),
+                                              (int32_t) rsnap->second.size());
+                    seed_source = "snapshot";
+                } else {
+                    constexpr int32_t REJOIN_SEED_K = 4;
+                    std::vector<RNN_Genome*> top = examm->get_top_genomes(REJOIN_SEED_K);
+                    for (RNN_Genome* g : top) to_send.push_back(g->copy());
+                    if (to_send.empty() && examm->get_best_genome() != nullptr) {
+                        to_send.push_back(examm->get_best_genome()->copy());
+                    }
+                    seed_source = "local_top_k";
                 }
+                for (RNN_Genome* g : to_send) {
+                    if (pending_outgoing.size() >= MAX_PENDING_TRANSFERS) break;
+                    queue_genome_send(GenomeTransferKind::BACKUP, rejoining_rank,
+                                      g, pending_outgoing);
+                    seeded++;
+                }
+                for (RNN_Genome* g : to_send) delete g;
+
+                Log::info("[REJOIN] rank %d seeded rank %d with %d genome(s) from %s.\n",
+                          rank, rejoining_rank, seeded, seed_source.c_str());
 
                 if (std::find(active_ranks.begin(), active_ranks.end(), rejoining_rank)
                         == active_ranks.end()) {
@@ -1365,7 +1755,8 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
 
                 ft_log.log("REJOIN_SEEDED", rejoining_rank, active_ranks.size(),
                            examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
-                           -1.0, "sent_best_genome;broadcast_rejoin_notify");
+                           -1.0,
+                           "source=" + seed_source + ";count=" + std::to_string(seeded));
 
                 Log::info("[REJOIN] rank %d: rank %d reintegrated. active_ranks=%zu\n",
                           rank, rejoining_rank, active_ranks.size());
@@ -1552,6 +1943,21 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                                 length, pending_incoming);
         }
 
+        // SNAPSHOT length-tag receive: post the chunked data receive that follows.
+        while (pending_incoming_snapshots.size() < MAX_PENDING_TRANSFERS) {
+            int        snap_flag = 0;
+            MPI_Status st_snap;
+            MPI_Iprobe(MPI_ANY_SOURCE, SNAPSHOT_LENGTH_TAG, MPI_COMM_WORLD, &snap_flag, &st_snap);
+            if (!snap_flag) break;
+            int32_t length = 0;
+            MPI_Recv(&length, 1, MPI_INT, st_snap.MPI_SOURCE,
+                     SNAPSHOT_LENGTH_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (length > 0) {
+                post_snapshot_receive(st_snap.MPI_SOURCE, length, pending_incoming_snapshots);
+            }
+        }
+        progress_incoming_snapshots(pending_incoming_snapshots, peer_snapshots);
+
         if (max_rank == 1 && local_done) {
             consensus_reached = true;
             break;
@@ -1728,6 +2134,10 @@ int main(int argc, char** argv) {
     //   --heartbeat_interval_ms <ms>              ping frequency (default 1000)
     //   --heartbeat_timeout_ms  <ms>              silence before failure declared (default 5000)
     //
+    // Snapshot tuning:
+    //   --snapshot_interval_ms <ms>               periodic top-k push to ring successor
+    //                                             (default 10000; 0 = disabled)
+    //
     // Note: TOKEN_TIMEOUT is fixed at 2 × heartbeat_timeout_ms internally to
     // guarantee PEER_FAILED propagates before the first token regeneration
     // reaches the dead node's predecessor.
@@ -1742,6 +2152,7 @@ int main(int argc, char** argv) {
     get_argument(arguments, "--shutdown_after_seconds",             false, dropout_cfg.shutdown_after_seconds);
     get_argument(arguments, "--heartbeat_interval_ms",              false, dropout_cfg.heartbeat_interval_ms);
     get_argument(arguments, "--heartbeat_timeout_ms",               false, dropout_cfg.heartbeat_timeout_ms);
+    get_argument(arguments, "--snapshot_interval_ms",               false, dropout_cfg.snapshot_interval_ms);
 
     if (rank == 0) {
         if (dropout_cfg.dropout_rank >= 0) {

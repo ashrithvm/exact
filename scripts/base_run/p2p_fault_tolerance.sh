@@ -28,63 +28,67 @@
 #
 # Options (all optional — defaults shown):
 #   --np                  <int>    Number of MPI ranks              (default: 4)
-#   --wallclock           <int>    Max run time in seconds          (default: 1000)
+#   --wallclock           <int>    Max run time in seconds          (default: 600)
 #
 #   --dropout_rank        <int>    Rank for soft dropout            (default: 2)
 #   --dropout_after       <float>  Seconds before soft dropout      (default: 20)
 #   --recovery_after      <float>  Seconds before soft dropout recovers (default: 20)
-#   --no_dropout                   Disable soft dropout
+#   --no_dropout                   Disable soft dropout             (disabled by default)
 #
 #   --hard_crash_rank     <int>    Rank for hard crash              (default: 1)
-#   --hard_crash_after    <float>  Seconds before hard crash fires  (default: 50)
-#   --hard_crash_recovery <float>  Seconds before hard crash recovers (default: 30)
+#   --hard_crash_after    <float>  Seconds before hard crash fires  (default: 180)
+#   --hard_crash_recovery <float>  Seconds before hard crash recovers (default: 60)
 #   --no_hard_crash                Disable hard crash
 #
 #   --shutdown_rank       <int>    Rank for graceful shutdown       (default: 3)
 #   --shutdown_after      <float>  Seconds before shutdown fires    (default: 180)
-#   --no_shutdown                  Disable graceful shutdown
+#   --no_shutdown                  Disable graceful shutdown        (disabled by default)
 #
 #   --hb_interval         <int>    Heartbeat interval in ms         (default: 1000)
 #   --hb_timeout          <int>    Heartbeat timeout in ms          (default: 5000)
-#   --output              <str>    Output directory name            (default: c172_fault_tolerance)
+#   --snapshot_interval   <int>    Periodic top-k snapshot push (ms)(default: 10000, 0=off)
+#   --experiment          <str>    Experiment name (subfolder under test_output/experiments/) (default: hard_crash)
+#   --trial               <int>    Trial number within the experiment (default: 1)
 #   --skip_build                   Skip cmake/make step
 #   -h, --help                     Show this message
 #
-# Default run exercises all three modes in sequence:
-#   t=20s  rank 2 soft dropout  (recovers at t=40s)
-#   t=50s  rank 1 hard crash    (recovers at t=80s)
-#   t=180s rank 3 graceful shutdown (permanent)
+# Default run:
+#   wallclock 600s
+#   t=180s rank 1 hard crash    (recovers at t=240s)
+#   dropout and graceful shutdown disabled by default
 #
 # Example — only test hard crash:
 #   bash p2p_fault_tolerance.sh --no_dropout --no_shutdown
 #
 # Example — custom timing:
-#   bash p2p_fault_tolerance.sh --hard_crash_after 30 --hard_crash_recovery 20
+#   bash p2p_fault_tolerance.sh --hard_crash_after 180 --hard_crash_recovery 60
 # ============================================================
 
 set -e
 
 # ---- Defaults -----------------------------------------------
 NP=4
-WALLCLOCK=1000
+WALLCLOCK=600
 
 DROPOUT_RANK=2
 DROPOUT_AFTER=20
 RECOVERY_AFTER=20
-ENABLE_DROPOUT=true
+ENABLE_DROPOUT=false
 
 HARD_CRASH_RANK=1
-HARD_CRASH_AFTER=50
-HARD_CRASH_RECOVERY=30
+HARD_CRASH_AFTER=180
+HARD_CRASH_RECOVERY=60
 ENABLE_HARD_CRASH=true
 
 SHUTDOWN_RANK=3
 SHUTDOWN_AFTER=180
-ENABLE_SHUTDOWN=true
+ENABLE_SHUTDOWN=false
 
 HB_INTERVAL=1000
 HB_TIMEOUT=5000
-OUTPUT_NAME="c172_fault_tolerance"
+SNAPSHOT_INTERVAL=10000
+EXPERIMENT_NAME="hard_crash"
+TRIAL_NUM="1"
 SKIP_BUILD=false
 
 # ---- Parse args ---------------------------------------------
@@ -109,7 +113,9 @@ while [[ $# -gt 0 ]]; do
 
         --hb_interval)         HB_INTERVAL="$2";        shift 2 ;;
         --hb_timeout)          HB_TIMEOUT="$2";         shift 2 ;;
-        --output)              OUTPUT_NAME="$2";         shift 2 ;;
+        --snapshot_interval)   SNAPSHOT_INTERVAL="$2";  shift 2 ;;
+        --experiment)          EXPERIMENT_NAME="$2";    shift 2 ;;
+        --trial)               TRIAL_NUM="$2";          shift 2 ;;
         --skip_build)          SKIP_BUILD=true;          shift ;;
         -h|--help)
             sed -n '/^# Usage/,/^# ===/p' "$0" | sed 's/^# \?//'
@@ -125,7 +131,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXACT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$EXACT_DIR/build_p2p"
 DATASET_DIR="$EXACT_DIR/datasets/2019_ngafid_transfer"
-OUTPUT_DIR="$EXACT_DIR/test_output/$OUTPUT_NAME"
+EXPERIMENTS_DIR="$EXACT_DIR/test_output/experiments"
+OUTPUT_DIR="$EXPERIMENTS_DIR/$EXPERIMENT_NAME/trial_$TRIAL_NUM"
 
 # ---- Build --------------------------------------------------
 if [ "$SKIP_BUILD" = false ]; then
@@ -163,7 +170,8 @@ fi
 
 FT_FLAGS="$FT_FLAGS \
   --heartbeat_interval_ms  $HB_INTERVAL \
-  --heartbeat_timeout_ms   $HB_TIMEOUT"
+  --heartbeat_timeout_ms   $HB_TIMEOUT \
+  --snapshot_interval_ms   $SNAPSHOT_INTERVAL"
 
 # ---- Summary ------------------------------------------------
 echo ""
@@ -172,6 +180,7 @@ echo "  Ranks (--np):          $NP"
 echo "  Wallclock:             ${WALLCLOCK}s"
 echo "  Heartbeat interval:    ${HB_INTERVAL}ms   timeout: ${HB_TIMEOUT}ms"
 echo "  Token timeout:         $((HB_TIMEOUT * 2))ms  (2 × heartbeat_timeout)"
+echo "  Snapshot push:         every ${SNAPSHOT_INTERVAL}ms to ring successor (0 = disabled)"
 echo ""
 
 if [ "$ENABLE_DROPOUT" = true ]; then
@@ -198,6 +207,7 @@ echo "  [GRACEFUL SHUT] disabled"
 fi
 
 echo ""
+echo "  Experiment: $EXPERIMENT_NAME  /  Trial: $TRIAL_NUM"
 echo "  Output: $OUTPUT_DIR"
 echo "================================================================"
 echo ""
@@ -230,3 +240,7 @@ mpirun -np "$NP" mpi/examm_mpi \
 
 echo ""
 echo "=== Run complete. Results in: $OUTPUT_DIR"
+echo ""
+echo "To generate graphs, run:"
+echo "  python3 $EXACT_DIR/scripts/aggregate_results.py \\"
+echo "          $EXPERIMENTS_DIR"

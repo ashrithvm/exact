@@ -66,6 +66,16 @@ class IslandSpeciationStrategy : public SpeciationStrategy {
     vector<Island*> islands;
     RNN_Genome* global_best_genome;
 
+    // Maintained sorted (best-first) cache of the top-k genomes inserted into
+    // this strategy.  Used by the P2P fault tolerance layer to take periodic
+    // snapshots of this peer's best genetic material without scanning all
+    // islands on every snapshot.  Holds *copies* (lifetime owned by us).
+    int32_t top_k_size;
+    vector<RNN_Genome*> top_k_cache;
+
+    // Updates top_k_cache with a candidate (does not take ownership).
+    void update_top_k_cache(RNN_Genome* candidate);
+
     // Transfer learning class properties:
 
     bool transfer_learning;
@@ -135,6 +145,13 @@ class IslandSpeciationStrategy : public SpeciationStrategy {
      * \return the best genome of all islands or NULL if no genomes have yet been inserted
      */
     RNN_Genome* get_best_genome();
+
+    /**
+     * Returns up to k distinct best genomes drawn from across all islands, sorted
+     * best-first.  Used by the P2P REJOIN handler to seed a recovering node with
+     * more than one genome, reducing warmup cost after a hard crash.
+     */
+    std::vector<RNN_Genome*> get_top_genomes(int32_t k);
 
     /**
      * Gets the the worst genome of all the islands
