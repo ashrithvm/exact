@@ -165,18 +165,28 @@ static int32_t genome_owner_rank_dynamic(
 
 // Configuration for fault-tolerance simulation (parsed from CLI args).
 struct DropoutConfig {
-    // Unintentional failure: rank goes silent, peers detect via heartbeat timeout, rank recovers later.
-    int32_t dropout_rank            = -1;   // -1 = disabled
+    // Unintentional failure: ranks go silent, peers detect via heartbeat timeout, ranks recover later.
+    // Pass multiple ranks via --dropout_ranks r1 r2 r3 ...
+    std::vector<int32_t> dropout_ranks;             // empty = disabled
     double  dropout_after_seconds   = 0.0;
-    double  recovery_after_seconds  = 30.0; // seconds after dropout before rejoining
+    double  recovery_after_seconds  = 30.0;
 
-    // Intentional/graceful shutdown: rank broadcasts full state then permanently leaves.
-    int32_t shutdown_rank           = -1;   // -1 = disabled
+    // Intentional/graceful shutdown: ranks broadcast full state then permanently leave.
+    // Pass multiple ranks via --shutdown_ranks r1 r2 r3 ...
+    std::vector<int32_t> shutdown_ranks;            // empty = disabled
     double  shutdown_after_seconds  = 0.0;
 
     // Heartbeat tuning.
-    int32_t heartbeat_interval_ms   = 1000; // how often each rank pings its successor
-    int32_t heartbeat_timeout_ms    = 5000; // silence before successor declares failure
+    int32_t heartbeat_interval_ms   = 1000;
+    int32_t heartbeat_timeout_ms    = 5000;
+
+    // Convenience helpers.
+    bool is_dropout_rank(int32_t r)  const {
+        return std::find(dropout_ranks.begin(),  dropout_ranks.end(),  r) != dropout_ranks.end();
+    }
+    bool is_shutdown_rank(int32_t r) const {
+        return std::find(shutdown_ranks.begin(), shutdown_ranks.end(), r) != shutdown_ranks.end();
+    }
 };
 
 enum class GenomeTransferKind : int32_t {
@@ -888,7 +898,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         // No notification sent here; that's intentionally unrealistic.
         // =================================================================
         if (!dropout_sent
-            && dropout_cfg.dropout_rank == rank
+            && dropout_cfg.is_dropout_rank(rank)
             && dropout_cfg.dropout_after_seconds > 0.0
             && elapsed_s >= dropout_cfg.dropout_after_seconds
             && !local_done)
@@ -933,7 +943,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         // Rank knows it is leaving permanently — broadcasts full state first.
         // =================================================================
         if (!shutdown_sent
-            && dropout_cfg.shutdown_rank == rank
+            && dropout_cfg.is_shutdown_rank(rank)
             && dropout_cfg.shutdown_after_seconds > 0.0
             && elapsed_s >= dropout_cfg.shutdown_after_seconds
             && !local_done)
@@ -1518,37 +1528,59 @@ int main(int argc, char** argv) {
 
     // Fault-tolerance simulation flags (all optional).
     //
-    // Unintentional failure (heartbeat-detected, node recovers):
-    //   --dropout_rank <r>               rank that goes silent
-    //   --dropout_after_seconds <t>      when it goes silent
-    //   --recovery_after_seconds <t>     seconds after dropout before it rejoins
+    // Unintentional failure (heartbeat-detected, nodes recover):
+    //   --dropout_ranks <r1> [r2 r3 ...]  ranks that go silent (space-separated)
+    //   --dropout_after_seconds <t>        when they go silent
+    //   --recovery_after_seconds <t>       seconds after dropout before rejoining
     //
-    // Intentional/graceful shutdown (node broadcasts state then leaves permanently):
-    //   --shutdown_rank <r>              rank that shuts down
-    //   --shutdown_after_seconds <t>     when it shuts down
+    // Intentional/graceful shutdown (nodes broadcast state then permanently leave):
+    //   --shutdown_ranks <r1> [r2 r3 ...]  ranks that shut down (space-separated)
+    //   --shutdown_after_seconds <t>        when they shut down
     //
     // Heartbeat tuning:
-    //   --heartbeat_interval_ms <ms>     ping frequency (default 1000)
-    //   --heartbeat_timeout_ms  <ms>     silence before failure declared (default 5000)
+    //   --heartbeat_interval_ms <ms>   ping frequency (default 1000)
+    //   --heartbeat_timeout_ms  <ms>   silence before failure declared (default 5000)
     DropoutConfig dropout_cfg;
-    get_argument(arguments, "--dropout_rank",           false, dropout_cfg.dropout_rank);
+
+    // Parse dropout ranks (space-separated list of integers).
+    {
+        std::vector<std::string> dr_strs;
+        get_argument_vector(arguments, "--dropout_ranks", false, dr_strs);
+        for (const auto& s : dr_strs)
+            dropout_cfg.dropout_ranks.push_back(std::stoi(s));
+    }
     get_argument(arguments, "--dropout_after_seconds",  false, dropout_cfg.dropout_after_seconds);
     get_argument(arguments, "--recovery_after_seconds", false, dropout_cfg.recovery_after_seconds);
-    get_argument(arguments, "--shutdown_rank",          false, dropout_cfg.shutdown_rank);
+
+    // Parse shutdown ranks (space-separated list of integers).
+    {
+        std::vector<std::string> sr_strs;
+        get_argument_vector(arguments, "--shutdown_ranks", false, sr_strs);
+        for (const auto& s : sr_strs)
+            dropout_cfg.shutdown_ranks.push_back(std::stoi(s));
+    }
     get_argument(arguments, "--shutdown_after_seconds", false, dropout_cfg.shutdown_after_seconds);
     get_argument(arguments, "--heartbeat_interval_ms",  false, dropout_cfg.heartbeat_interval_ms);
     get_argument(arguments, "--heartbeat_timeout_ms",   false, dropout_cfg.heartbeat_timeout_ms);
 
     if (rank == 0) {
-        if (dropout_cfg.dropout_rank >= 0) {
-            Log::info("[SIM] Unintentional failure: rank %d silent at t=%.1fs, "
-                      "recovers after %.1fs\n",
-                      dropout_cfg.dropout_rank, dropout_cfg.dropout_after_seconds,
+        if (!dropout_cfg.dropout_ranks.empty()) {
+            std::string rlist;
+            for (int32_t r : dropout_cfg.dropout_ranks)
+                rlist += std::to_string(r) + " ";
+            Log::info("[SIM] Unintentional failure: ranks [%s] silent at t=%.1fs, "
+                      "recover after %.1fs\n",
+                      rlist.c_str(),
+                      dropout_cfg.dropout_after_seconds,
                       dropout_cfg.recovery_after_seconds);
         }
-        if (dropout_cfg.shutdown_rank >= 0) {
-            Log::info("[SIM] Graceful shutdown: rank %d permanently leaves at t=%.1fs\n",
-                      dropout_cfg.shutdown_rank, dropout_cfg.shutdown_after_seconds);
+        if (!dropout_cfg.shutdown_ranks.empty()) {
+            std::string rlist;
+            for (int32_t r : dropout_cfg.shutdown_ranks)
+                rlist += std::to_string(r) + " ";
+            Log::info("[SIM] Graceful shutdown: ranks [%s] permanently leave at t=%.1fs\n",
+                      rlist.c_str(),
+                      dropout_cfg.shutdown_after_seconds);
         }
     }
 
