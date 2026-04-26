@@ -7,42 +7,49 @@
 # Usage:
 #   bash p2p_fault_tolerance.sh [OPTIONS]
 #
-# Options (all optional — defaults shown):
-#   --np                  <int>    Number of MPI ranks              (default: 4)
-#   --wallclock           <int>    Max run time in seconds          (default: 1000)
-#   --dropout_rank        <int>    Rank for unintentional failure   (default: 2)
-#   --dropout_after       <float>  Seconds before dropout fires     (default: 20)
-#   --recovery_after      <float>  Seconds before dropout recovers  (default: 20)
-#   --shutdown_rank       <int>    Rank for graceful shutdown       (default: 3)
-#   --shutdown_after      <float>  Seconds before shutdown fires    (default: 180)
-#   --hb_interval         <int>    Heartbeat interval in ms         (default: 1000)
-#   --hb_timeout          <int>    Heartbeat timeout in ms          (default: 5000)
-#   --output              <str>    Output directory name            (default: c172_fault_tolerance)
-#   --no_dropout                   Disable unintentional failure
-#   --no_shutdown                  Disable graceful shutdown
-#   --skip_build                   Skip cmake/make step
-#   -h, --help                     Show this message
+# Options (all optional - defaults shown):
+#   --np                  <int>       Number of MPI ranks              (default: 4)
+#   --wallclock           <int>       Max run time in seconds          (default: 600)
+#   --dropout_ranks       <int...>    Ranks for unintentional failure  (default: "2")
+#   --dropout_after       <float>     Seconds before dropout fires     (default: 180)
+#   --recovery_after      <float>     Seconds before dropout recovers  (default: 60)
+#   --shutdown_ranks      <int...>    Ranks for graceful shutdown      (default: "3")
+#   --shutdown_after      <float>     Seconds before shutdown fires    (default: 480)
+#   --hb_interval         <int>       Heartbeat interval in ms         (default: 1000)
+#   --hb_timeout          <int>       Heartbeat timeout in ms          (default: 5000)
+#   --output              <str>       Output directory name            (default: c172_fault_tolerance)
+#   --no_dropout                      Disable unintentional failure
+#   --no_shutdown                     Disable graceful shutdown
+#   --skip_build                      Skip cmake/make step
+#   -h, --help                        Show this message
 #
-# Example — defaults (dropout rank 2 at 20s, shutdown rank 3 at 3 min):
-#   bash p2p_fault_tolerance.sh
+# Examples:
+#   # Clean run (no faults)
+#   bash p2p_fault_tolerance.sh --no_dropout --no_shutdown --output clean
 #
-# Example — custom timing:
-#   bash p2p_fault_tolerance.sh --dropout_after 60 --recovery_after 30 --shutdown_after 300
+#   # 1 unintentional dropout at 3 min, recovers after 1 min
+#   bash p2p_fault_tolerance.sh --dropout_ranks "1" --dropout_after 180 --recovery_after 60 --no_shutdown
 #
-# Example — disable shutdown, only test unintentional failure:
-#   bash p2p_fault_tolerance.sh --no_shutdown
+#   # 3 simultaneous dropouts at 3 min, recover after 1 min
+#   bash p2p_fault_tolerance.sh --dropout_ranks "1 2 3" --dropout_after 180 --recovery_after 60 --no_shutdown
+#
+#   # 1 graceful shutdown at 3 min
+#   bash p2p_fault_tolerance.sh --no_dropout --shutdown_ranks "1" --shutdown_after 180
+#
+#   # 3 simultaneous graceful shutdowns at 3 min
+#   bash p2p_fault_tolerance.sh --no_dropout --shutdown_ranks "1 2 3" --shutdown_after 180
 # ============================================================
 
 set -e
 
 # ---- Defaults -----------------------------------------------
 NP=4
-WALLCLOCK=1000
-DROPOUT_RANK=2
-DROPOUT_AFTER=20
-RECOVERY_AFTER=20
-SHUTDOWN_RANK=3
-SHUTDOWN_AFTER=180
+WALLCLOCK=600
+DROPOUT_RANKS="2"
+DROPOUT_AFTER=180
+RECOVERY_AFTER=60
+SHUTDOWN_RANKS="3"
+SHUTDOWN_AFTER=480
 HB_INTERVAL=1000
 HB_TIMEOUT=5000
 OUTPUT_NAME="c172_fault_tolerance"
@@ -53,19 +60,19 @@ SKIP_BUILD=false
 # ---- Parse args ---------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --np)                NP="$2";            shift 2 ;;
-        --wallclock)         WALLCLOCK="$2";      shift 2 ;;
-        --dropout_rank)      DROPOUT_RANK="$2";   shift 2 ;;
-        --dropout_after)     DROPOUT_AFTER="$2";  shift 2 ;;
-        --recovery_after)    RECOVERY_AFTER="$2"; shift 2 ;;
-        --shutdown_rank)     SHUTDOWN_RANK="$2";  shift 2 ;;
-        --shutdown_after)    SHUTDOWN_AFTER="$2"; shift 2 ;;
-        --hb_interval)       HB_INTERVAL="$2";    shift 2 ;;
-        --hb_timeout)        HB_TIMEOUT="$2";     shift 2 ;;
-        --output)            OUTPUT_NAME="$2";    shift 2 ;;
-        --no_dropout)        ENABLE_DROPOUT=false; shift ;;
-        --no_shutdown)       ENABLE_SHUTDOWN=false; shift ;;
-        --skip_build)        SKIP_BUILD=true;     shift ;;
+        --np)             NP="$2";             shift 2 ;;
+        --wallclock)      WALLCLOCK="$2";       shift 2 ;;
+        --dropout_ranks)  DROPOUT_RANKS="$2";   shift 2 ;;
+        --dropout_after)  DROPOUT_AFTER="$2";   shift 2 ;;
+        --recovery_after) RECOVERY_AFTER="$2";  shift 2 ;;
+        --shutdown_ranks) SHUTDOWN_RANKS="$2";  shift 2 ;;
+        --shutdown_after) SHUTDOWN_AFTER="$2";  shift 2 ;;
+        --hb_interval)    HB_INTERVAL="$2";     shift 2 ;;
+        --hb_timeout)     HB_TIMEOUT="$2";      shift 2 ;;
+        --output)         OUTPUT_NAME="$2";     shift 2 ;;
+        --no_dropout)     ENABLE_DROPOUT=false; shift ;;
+        --no_shutdown)    ENABLE_SHUTDOWN=false; shift ;;
+        --skip_build)     SKIP_BUILD=true;      shift ;;
         -h|--help)
             sed -n '/^# Usage/,/^# ===/p' "$0" | sed 's/^# \?//'
             exit 0 ;;
@@ -98,14 +105,14 @@ FT_FLAGS=""
 
 if [ "$ENABLE_DROPOUT" = true ]; then
     FT_FLAGS="$FT_FLAGS \
-  --dropout_rank        $DROPOUT_RANK \
+  --dropout_ranks          $DROPOUT_RANKS \
   --dropout_after_seconds  $DROPOUT_AFTER \
   --recovery_after_seconds $RECOVERY_AFTER"
 fi
 
 if [ "$ENABLE_SHUTDOWN" = true ]; then
     FT_FLAGS="$FT_FLAGS \
-  --shutdown_rank          $SHUTDOWN_RANK \
+  --shutdown_ranks         $SHUTDOWN_RANKS \
   --shutdown_after_seconds $SHUTDOWN_AFTER"
 fi
 
@@ -119,14 +126,14 @@ echo "=== Fault-Tolerance Simulation ================================="
 echo "  Ranks (--np):          $NP"
 echo "  Wallclock:             ${WALLCLOCK}s"
 if [ "$ENABLE_DROPOUT" = true ]; then
-echo "  Unintentional failure: rank $DROPOUT_RANK silent at t=${DROPOUT_AFTER}s, recovers after ${RECOVERY_AFTER}s"
+    echo "  Unintentional failure: ranks [$DROPOUT_RANKS] silent at t=${DROPOUT_AFTER}s, recover after ${RECOVERY_AFTER}s"
 else
-echo "  Unintentional failure: disabled"
+    echo "  Unintentional failure: disabled"
 fi
 if [ "$ENABLE_SHUTDOWN" = true ]; then
-echo "  Graceful shutdown:     rank $SHUTDOWN_RANK leaves at t=${SHUTDOWN_AFTER}s (permanent)"
+    echo "  Graceful shutdown:     ranks [$SHUTDOWN_RANKS] leave at t=${SHUTDOWN_AFTER}s (permanent)"
 else
-echo "  Graceful shutdown:     disabled"
+    echo "  Graceful shutdown:     disabled"
 fi
 echo "  Heartbeat interval:    ${HB_INTERVAL}ms   timeout: ${HB_TIMEOUT}ms"
 echo "  Output:                $OUTPUT_DIR"
