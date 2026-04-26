@@ -264,7 +264,8 @@ int main(int argc, char** argv) {
         if (rank == 0) {
             progress_outgoing(pending_outgoing);
         } else {
-            progress_incoming(pending_incoming, ex_for_injection, rank, /*max_rank*/ 2);
+            std::vector<int32_t> all_ranks = {0, 1};
+            progress_incoming(pending_incoming, ex_for_injection, rank, all_ranks);
         }
 
         bool outgoing_done = (rank == 0) ? pending_outgoing.empty() : true;

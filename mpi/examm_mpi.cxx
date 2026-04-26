@@ -138,12 +138,10 @@ static int32_t genome_owner_rank(const RNN_Genome* genome, int32_t max_rank) {
 }
 
 // Returns the next alive rank after `my_rank` in the sorted active_ranks ring.
-// If my_rank is the highest alive rank, wraps around to active_ranks[0].
+// Uses binary search (O(log N)) rather than a linear scan.
 static int32_t next_alive_rank(int32_t my_rank, const std::vector<int32_t>& active_ranks) {
-    for (int32_t r : active_ranks) {
-        if (r > my_rank) return r;
-    }
-    return active_ranks[0];  // wrap around
+    auto it = std::upper_bound(active_ranks.begin(), active_ranks.end(), my_rank);
+    return (it == active_ranks.end()) ? active_ranks[0] : *it;
 }
 
 // Ownership mapping using only currently-alive ranks so MIGRATE never
@@ -246,6 +244,31 @@ static void queue_genome_send(
     }
 
     pending_outgoing.push_back(std::move(transfer));
+}
+
+// ---- Non-blocking pool for small control messages (heartbeat, token, etc.) ----
+// Keeps MPI_Send buffers alive until the underlying transfer completes.
+struct SmallOutgoing {
+    std::vector<int32_t> buf;
+    MPI_Request req;
+};
+
+static void isend_small(const int32_t* data, int32_t count, int32_t dest, int32_t tag,
+                        std::vector<SmallOutgoing>& pool)
+{
+    SmallOutgoing s;
+    s.buf.assign(data, data + count);
+    MPI_Isend(s.buf.data(), count, MPI_INT, dest, tag, MPI_COMM_WORLD, &s.req);
+    pool.push_back(std::move(s));
+}
+
+static void drain_small_pool(std::vector<SmallOutgoing>& pool) {
+    for (size_t i = 0; i < pool.size();) {
+        int flag = 0;
+        MPI_Test(&pool[i].req, &flag, MPI_STATUS_IGNORE);
+        if (flag) pool.erase(pool.begin() + i);
+        else       ++i;
+    }
 }
 
 static void post_genome_receive(
@@ -827,7 +850,11 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
 
     std::vector<IncomingGenomeTransfer> pending_incoming;
     std::vector<OutgoingGenomeTransfer> pending_outgoing;
+    std::vector<SmallOutgoing>          small_pending;   // non-blocking pool for control msgs
     constexpr size_t MAX_PENDING_TRANSFERS = 8;
+
+    // Return error codes instead of aborting when a transport disconnect occurs.
+    MPI_Comm_set_errhandler(MPI_COMM_WORLD, MPI_ERRORS_RETURN);
 
     const auto start_time = std::chrono::steady_clock::now();
 
@@ -840,9 +867,11 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     tm_log.open(examm->get_output_directory(), start_time);
 
     // ----- Heartbeat state -----
-    // Each rank sends a heartbeat to ring_successor every heartbeat_interval_ms.
-    // Each rank monitors ring_predecessor — silence past heartbeat_timeout_ms = failure.
-    auto last_heartbeat_sent     = start_time;
+    // Each rank sends a heartbeat to ring_successor every heartbeat_interval_ms,
+    // but only if no other message was already sent to ring_successor in that window
+    // (piggybacking: any traffic to the successor proves liveness to it).
+    // On the receive side we also count a token from ring_predecessor as a heartbeat.
+    auto last_sent_to_succ        = start_time; // any send to ring_successor
     auto last_heartbeat_from_pred = start_time;
     bool predecessor_declared_dead = false;
     // Don't fire the timeout until one full timeout window has elapsed
@@ -869,9 +898,10 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     // Token fields: [0]=origin_rank [1]=hop_count [2]=done_count [3]=final_flag
     if (rank == 0 && max_rank > 1) {
         int32_t token[4] = {0, 0, 0, 0};
-        MPI_Send(token, 4, MPI_INT, ring_successor, TERMINATION_TOKEN_TAG, MPI_COMM_WORLD);
-        token_last_seen = std::chrono::steady_clock::now();
-        token_ever_seen = true;
+        isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
+        last_sent_to_succ = std::chrono::steady_clock::now();
+        token_last_seen   = std::chrono::steady_clock::now();
+        token_ever_seen   = true;
     }
 
     std::string peer_log_id = "peer_" + to_string(rank);
@@ -959,8 +989,13 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             // Announce permanent departure to all active peers.
             for (int32_t r : active_ranks) {
                 if (r != rank) {
-                    MPI_Send(&rank, 1, MPI_INT, r, GRACEFUL_SHUTDOWN_TAG, MPI_COMM_WORLD);
+                    isend_small(&rank, 1, r, GRACEFUL_SHUTDOWN_TAG, small_pending);
                 }
+            }
+            // Flush the small pool so shutdown messages are in-flight before we stop.
+            while (!small_pending.empty()) {
+                drain_small_pool(small_pending);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
             shutdown_sent = true;
@@ -1000,7 +1035,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             // Request genome seed from the lowest active rank.
             if (!active_ranks.empty()) {
                 int32_t target = active_ranks[0];
-                MPI_Send(&rank, 1, MPI_INT, target, REJOIN_REQUEST_TAG, MPI_COMM_WORLD);
+                isend_small(&rank, 1, target, REJOIN_REQUEST_TAG, small_pending);
                 Log::info("[REJOIN] rank %d sent REJOIN_REQUEST to rank %d\n", rank, target);
             }
 
@@ -1016,17 +1051,20 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         // =================================================================
         // HEARTBEAT SEND
         // Skipped while this rank is dropped (silent) or permanently shut down.
+        // Only fires if no other message was already sent to ring_successor in
+        // this interval — any traffic to the successor proves liveness (piggybacking).
         // =================================================================
         if (!is_dropped && !is_shutdown && max_rank > 1) {
-            if (now - last_heartbeat_sent >= hb_interval) {
-                MPI_Send(&rank, 1, MPI_INT, ring_successor, HEARTBEAT_TAG, MPI_COMM_WORLD);
-                last_heartbeat_sent = now;
+            if (now - last_sent_to_succ >= hb_interval) {
+                isend_small(&rank, 1, ring_successor, HEARTBEAT_TAG, small_pending);
+                last_sent_to_succ = now;
             }
         }
 
         // Progress background transfers.
         progress_outgoing(pending_outgoing);
         progress_incoming(pending_incoming, examm, rank, active_ranks);
+        drain_small_pool(small_pending);
 
         // =================================================================
         // HEARTBEAT RECEIVE
@@ -1072,8 +1110,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 // Broadcast to all other active ranks (not predecessor, not self).
                 for (int32_t r : active_ranks) {
                     if (r != rank && r != ring_predecessor) {
-                        MPI_Send(&ring_predecessor, 1, MPI_INT, r,
-                                 PEER_FAILED_TAG, MPI_COMM_WORLD);
+                        isend_small(&ring_predecessor, 1, r, PEER_FAILED_TAG, small_pending);
                     }
                 }
 
@@ -1205,8 +1242,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
 
                 for (int32_t r : active_ranks) {
                     if (r != rank) {
-                        MPI_Send(&rejoining_rank, 1, MPI_INT, r,
-                                 REJOIN_NOTIFY_TAG, MPI_COMM_WORLD);
+                        isend_small(&rejoining_rank, 1, r, REJOIN_NOTIFY_TAG, small_pending);
                     }
                 }
 
@@ -1278,6 +1314,13 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 token_last_seen = std::chrono::steady_clock::now();
                 token_ever_seen = true;
 
+                // Receiving a token from ring_predecessor proves it is alive —
+                // reset the heartbeat timestamp (piggybacking on ring traffic).
+                if (st_token.MPI_SOURCE == ring_predecessor) {
+                    last_heartbeat_from_pred  = now;
+                    predecessor_declared_dead = false;
+                }
+
                 const int32_t origin     = token[0];
                 int32_t       hop        = token[1];
                 int32_t       done       = token[2];
@@ -1286,8 +1329,8 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 if (final_flag != 0) {
                     consensus_reached = true;
                     if (ring_successor != rank) {
-                        MPI_Send(token, 4, MPI_INT, ring_successor,
-                                 TERMINATION_TOKEN_TAG, MPI_COMM_WORLD);
+                        isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
+                        last_sent_to_succ = now;
                     }
                     break;
                 }
@@ -1308,8 +1351,8 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                     token[2] = done;
                 }
 
-                MPI_Send(token, 4, MPI_INT, ring_successor,
-                         TERMINATION_TOKEN_TAG, MPI_COMM_WORLD);
+                isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
+                last_sent_to_succ = now;
             }
         }
 
@@ -1327,9 +1370,9 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                     Log::info("[TOKEN] rank %d regenerating lost termination token "
                               "(%.1fs silent).\n", rank, silence_s);
                     int32_t token[4] = {rank, 0, local_done ? 1 : 0, 0};
-                    MPI_Send(token, 4, MPI_INT, ring_successor,
-                             TERMINATION_TOKEN_TAG, MPI_COMM_WORLD);
-                    token_last_seen = std::chrono::steady_clock::now();
+                    isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
+                    last_sent_to_succ = now;
+                    token_last_seen   = std::chrono::steady_clock::now();
 
                     ft_log.log("TOKEN_RECOVERED", rank, active_ranks.size(),
                                examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
@@ -1441,6 +1484,12 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         }
     }
     progress_outgoing(pending_outgoing);
+
+    // Wait for any in-flight small control messages (heartbeats, tokens, etc.).
+    for (auto& s : small_pending) {
+        MPI_Wait(&s.req, MPI_STATUS_IGNORE);
+    }
+    small_pending.clear();
 
     // Write summary row now that the run is complete.
     const double total_wall_time =
