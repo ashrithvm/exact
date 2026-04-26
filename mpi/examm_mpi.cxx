@@ -164,9 +164,17 @@ static int32_t genome_owner_rank_dynamic(
 // Configuration for fault-tolerance simulation (parsed from CLI args).
 struct DropoutConfig {
     // Unintentional failure: rank goes silent, peers detect via heartbeat timeout, rank recovers later.
+    // Process stays alive but stops all heartbeats and evolution (simulates network partition).
     int32_t dropout_rank            = -1;   // -1 = disabled
     double  dropout_after_seconds   = 0.0;
     double  recovery_after_seconds  = 30.0; // seconds after dropout before rejoining
+
+    // Genuine hard crash: process stops ALL MPI activity immediately — no last-words send,
+    // no token forwarding, no message polling.  Severs the physical ring.
+    // Peers detect via heartbeat timeout; token ring recovers via regeneration + logical routing.
+    int32_t hard_crash_rank                   = -1;   // -1 = disabled
+    double  hard_crash_after_seconds          = 0.0;
+    double  hard_crash_recovery_after_seconds = 30.0; // seconds after crash before rejoining
 
     // Intentional/graceful shutdown: rank broadcasts full state then permanently leaves.
     int32_t shutdown_rank           = -1;   // -1 = disabled
@@ -265,10 +273,35 @@ static void isend_small(const int32_t* data, int32_t count, int32_t dest, int32_
 static void drain_small_pool(std::vector<SmallOutgoing>& pool) {
     for (size_t i = 0; i < pool.size();) {
         int flag = 0;
-        MPI_Test(&pool[i].req, &flag, MPI_STATUS_IGNORE);
-        if (flag) pool.erase(pool.begin() + i);
-        else       ++i;
+        int rc = MPI_Test(&pool[i].req, &flag, MPI_STATUS_IGNORE);
+        // Remove on completion OR on error (dead destination returns MPI_ERR_*).
+        if (flag || rc != MPI_SUCCESS) pool.erase(pool.begin() + i);
+        else                            ++i;
     }
+}
+
+// Cancel and synchronously wait on every request in a vector, then free C++ memory.
+// Used when simulating a hard crash to immediately purge all in-flight state.
+static void cancel_and_free_outgoing(std::vector<OutgoingGenomeTransfer>& v) {
+    for (auto& t : v) {
+        for (auto& r : t.requests) { MPI_Cancel(&r); MPI_Wait(&r, MPI_STATUS_IGNORE); }
+        if (t.byte_array) free(t.byte_array);
+        if (t.length_ptr) delete t.length_ptr;
+    }
+    v.clear();
+}
+
+static void cancel_and_free_incoming(std::vector<IncomingGenomeTransfer>& v) {
+    for (auto& t : v) {
+        for (auto& r : t.requests) { MPI_Cancel(&r); MPI_Wait(&r, MPI_STATUS_IGNORE); }
+        delete[] t.buffer;
+    }
+    v.clear();
+}
+
+static void cancel_and_free_small(std::vector<SmallOutgoing>& v) {
+    for (auto& s : v) { MPI_Cancel(&s.req); MPI_Wait(&s.req, MPI_STATUS_IGNORE); }
+    v.clear();
 }
 
 static void post_genome_receive(
@@ -880,11 +913,17 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     const auto hb_interval = std::chrono::milliseconds(dropout_cfg.heartbeat_interval_ms);
     const auto hb_timeout  = std::chrono::milliseconds(dropout_cfg.heartbeat_timeout_ms);
 
-    // ----- Unintentional dropout state -----
+    // ----- Unintentional dropout state (soft: process stays alive, stops heartbeats) -----
     bool   is_dropped       = false;
     bool   dropout_sent     = false;
     bool   recovery_sent    = false;
     double dropout_time_s   = -1.0;
+
+    // ----- Hard crash state (hard: all MPI suspended, ring severed) -----
+    bool   is_hard_crashed          = false;
+    bool   hard_crash_triggered     = false;
+    bool   hard_crash_recovery_sent = false;
+    double hard_crash_time_s        = -1.0;
 
     // ----- Graceful shutdown state -----
     bool shutdown_sent = false;
@@ -910,6 +949,84 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     while (!consensus_reached) {
         const auto   now       = std::chrono::steady_clock::now();
         const double elapsed_s = std::chrono::duration<double>(now - start_time).count();
+
+        // =================================================================
+        // HARD CRASH TRIGGER
+        // Simulates genuine process death: ALL MPI activity stops immediately.
+        // No last-words send, no state broadcast — the node simply vanishes.
+        // Peers detect silence via heartbeat timeout exactly as in a real crash.
+        // The physical token ring is severed here; the regeneration + logical-
+        // routing mechanism below handles termination consensus.
+        // =================================================================
+        if (!hard_crash_triggered
+            && dropout_cfg.hard_crash_rank == rank
+            && dropout_cfg.hard_crash_after_seconds > 0.0
+            && elapsed_s >= dropout_cfg.hard_crash_after_seconds
+            && !local_done)
+        {
+            cancel_and_free_outgoing(pending_outgoing);
+            cancel_and_free_incoming(pending_incoming);
+            cancel_and_free_small(small_pending);
+
+            is_hard_crashed      = true;
+            hard_crash_triggered = true;
+            local_done           = true;
+            hard_crash_time_s    = elapsed_s;
+
+            active_ranks.erase(
+                std::remove(active_ranks.begin(), active_ranks.end(), rank),
+                active_ranks.end()
+            );
+
+            ft_log.log("HARD_CRASH", rank, active_ranks.size(),
+                       examm->get_best_fitness(),
+                       (examm->get_best_genome() ? examm->get_best_genome()->get_generation_id() : 0),
+                       -1.0, "all_mpi_suspended;ring_severed");
+            ft_log.total_dropout_events++;
+            if (ft_log.fitness_at_first_failure < 0.0)
+                ft_log.fitness_at_first_failure = examm->get_best_fitness();
+
+            Log::info("[HARD_CRASH] t=%.1fs  rank %d: simulating hard crash. "
+                      "All MPI suspended. Peers will detect via heartbeat timeout.\n",
+                      elapsed_s, rank);
+        }
+
+        // =================================================================
+        // HARD CRASH GATE
+        // While crashed, skip every MPI operation.  Only check the recovery
+        // timer; when it fires, clear the flag, send REJOIN_REQUEST, and fall
+        // through to normal loop processing on the same iteration.
+        // =================================================================
+        if (is_hard_crashed) {
+            if (!hard_crash_recovery_sent
+                && dropout_cfg.hard_crash_recovery_after_seconds > 0.0
+                && elapsed_s >= hard_crash_time_s + dropout_cfg.hard_crash_recovery_after_seconds)
+            {
+                is_hard_crashed          = false;
+                local_done               = false;
+                hard_crash_recovery_sent = true;
+                predecessor_declared_dead = false;
+                last_heartbeat_from_pred  = now;
+
+                if (!active_ranks.empty()) {
+                    isend_small(&rank, 1, active_ranks[0], REJOIN_REQUEST_TAG, small_pending);
+                    Log::info("[HARD_CRASH_REJOIN] t=%.1fs  rank %d waking up. "
+                              "Sent REJOIN_REQUEST to rank %d.\n",
+                              elapsed_s, rank, active_ranks[0]);
+                }
+
+                ft_log.log("HARD_CRASH_REJOIN_REQUESTED", rank, active_ranks.size(),
+                           examm->get_best_fitness(),
+                           (examm->get_best_genome() ? examm->get_best_genome()->get_generation_id() : 0),
+                           elapsed_s - hard_crash_time_s,
+                           "downtime_s=" + std::to_string(elapsed_s - hard_crash_time_s));
+                // Fall through: is_hard_crashed is now false so the rest of the
+                // loop runs normally on this iteration.
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;  // skip all MPI until recovery fires
+            }
+        }
 
         // =================================================================
         // UNINTENTIONAL DROPOUT TRIGGER
@@ -1054,7 +1171,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         // Only fires if no other message was already sent to ring_successor in
         // this interval — any traffic to the successor proves liveness (piggybacking).
         // =================================================================
-        if (!is_dropped && !is_shutdown && max_rank > 1) {
+        if (!is_dropped && !is_shutdown && !is_hard_crashed && max_rank > 1) {
             if (now - last_sent_to_succ >= hb_interval) {
                 isend_small(&rank, 1, ring_successor, HEARTBEAT_TAG, small_pending);
                 last_sent_to_succ = now;
@@ -1282,7 +1399,9 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
 
                 if (rejoining_rank == rank) {
                     local_done = false;
-                    const double downtime_s = elapsed_s - dropout_time_s;
+                    // Pick the right crash-start time: hard crash takes precedence over soft dropout.
+                    const double crash_start  = hard_crash_triggered ? hard_crash_time_s : dropout_time_s;
+                    const double downtime_s   = elapsed_s - crash_start;
                     ft_log.log("REJOIN_COMPLETE", rank, active_ranks.size(),
                                examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
                                downtime_s,
@@ -1301,9 +1420,30 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
         }
 
         // =================================================================
-        // TOKEN-RING TERMINATION CONSENSUS (physical ring, unchanged logic).
+        // TOKEN-RING TERMINATION CONSENSUS
+        // The token travels the LOGICAL ring: it prefers ring_successor but
+        // skips it if that rank is not in active_ranks (hard-crashed or gone).
+        // Termination check uses active_ranks.size() so consensus is correct
+        // after permanent departures.
+        //
+        // Invariant: TOKEN_TIMEOUT = 2 × heartbeat_timeout so PEER_FAILED
+        // propagates to every live peer before the first regenerated token
+        // reaches the dead node's predecessor again, ensuring send_token()
+        // already routes around the gap on the first successful regeneration.
         // =================================================================
         {
+            // Route token to next alive peer, preferring physical ring_successor.
+            auto send_token = [&](int32_t* tok) {
+                int32_t dest = ring_successor;
+                if (!active_ranks.empty() &&
+                    std::find(active_ranks.begin(), active_ranks.end(), ring_successor)
+                            == active_ranks.end()) {
+                    dest = next_alive_rank(rank, active_ranks);
+                }
+                isend_small(tok, 4, dest, TERMINATION_TOKEN_TAG, small_pending);
+                if (dest == ring_successor) last_sent_to_succ = now;
+            };
+
             int        flag_token = 0;
             MPI_Status st_token;
             MPI_Iprobe(MPI_ANY_SOURCE, TERMINATION_TOKEN_TAG, MPI_COMM_WORLD, &flag_token, &st_token);
@@ -1314,8 +1454,7 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                 token_last_seen = std::chrono::steady_clock::now();
                 token_ever_seen = true;
 
-                // Receiving a token from ring_predecessor proves it is alive —
-                // reset the heartbeat timestamp (piggybacking on ring traffic).
+                // Token from ring_predecessor proves it is alive (piggybacking).
                 if (st_token.MPI_SOURCE == ring_predecessor) {
                     last_heartbeat_from_pred  = now;
                     predecessor_declared_dead = false;
@@ -1328,38 +1467,34 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
 
                 if (final_flag != 0) {
                     consensus_reached = true;
-                    if (ring_successor != rank) {
-                        isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
-                        last_sent_to_succ = now;
-                    }
+                    if (ring_successor != rank) send_token(token);
                     break;
                 }
 
                 if (local_done) done += 1;
                 hop += 1;
 
-                if (hop >= max_rank && rank == origin) {
+                // alive_count: number of live peers the token must visit.
+                const int32_t alive_count = (int32_t)active_ranks.size();
+                if (hop >= alive_count && rank == origin) {
                     token[2] = done;
-                    if (done >= max_rank) {
-                        token[3] = 1;
-                    } else {
-                        token[2] = 0;
-                    }
+                    token[3] = (done >= alive_count) ? 1 : 0;
+                    if (!token[3]) token[2] = 0;
                     token[1] = 0;
                 } else {
                     token[1] = hop;
                     token[2] = done;
                 }
 
-                isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
-                last_sent_to_succ = now;
+                send_token(token);
             }
         }
 
         // =================================================================
         // TOKEN-RING RECOVERY
-        // If the token is lost (holder dropped before forwarding), the lowest
-        // active rank regenerates it after TOKEN_TIMEOUT of silence.
+        // If the token is lost because a hard-crashed holder never forwarded
+        // it, the lowest active rank regenerates after TOKEN_TIMEOUT.
+        // By then PEER_FAILED has propagated so send_token skips the gap.
         // =================================================================
         if (token_ever_seen && max_rank > 1) {
             if (std::chrono::steady_clock::now() - token_last_seen > TOKEN_TIMEOUT) {
@@ -1370,12 +1505,20 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
                     Log::info("[TOKEN] rank %d regenerating lost termination token "
                               "(%.1fs silent).\n", rank, silence_s);
                     int32_t token[4] = {rank, 0, local_done ? 1 : 0, 0};
-                    isend_small(token, 4, ring_successor, TERMINATION_TOKEN_TAG, small_pending);
-                    last_sent_to_succ = now;
-                    token_last_seen   = std::chrono::steady_clock::now();
+
+                    int32_t dest = ring_successor;
+                    if (!active_ranks.empty() &&
+                        std::find(active_ranks.begin(), active_ranks.end(), ring_successor)
+                                == active_ranks.end()) {
+                        dest = next_alive_rank(rank, active_ranks);
+                    }
+                    isend_small(token, 4, dest, TERMINATION_TOKEN_TAG, small_pending);
+                    if (dest == ring_successor) last_sent_to_succ = now;
+                    token_last_seen = std::chrono::steady_clock::now();
 
                     ft_log.log("TOKEN_RECOVERED", rank, active_ranks.size(),
-                               examm->get_best_fitness(), (examm->get_best_genome() != nullptr ? examm->get_best_genome()->get_generation_id() : 0),
+                               examm->get_best_fitness(),
+                               (examm->get_best_genome() ? examm->get_best_genome()->get_generation_id() : 0),
                                -1.0, "silence_s=" + std::to_string(silence_s));
                     ft_log.token_recoveries++;
                 }
@@ -1567,33 +1710,51 @@ int main(int argc, char** argv) {
 
     // Fault-tolerance simulation flags (all optional).
     //
-    // Unintentional failure (heartbeat-detected, node recovers):
-    //   --dropout_rank <r>               rank that goes silent
-    //   --dropout_after_seconds <t>      when it goes silent
-    //   --recovery_after_seconds <t>     seconds after dropout before it rejoins
+    // Soft dropout — process stays alive, stops heartbeats (network partition):
+    //   --dropout_rank <r>                        rank that goes silent
+    //   --dropout_after_seconds <t>               when it goes silent
+    //   --recovery_after_seconds <t>              seconds after dropout before rejoining
     //
-    // Intentional/graceful shutdown (node broadcasts state then leaves permanently):
-    //   --shutdown_rank <r>              rank that shuts down
-    //   --shutdown_after_seconds <t>     when it shuts down
+    // Hard crash — ALL MPI suspended immediately, ring severed (genuine process death):
+    //   --hard_crash_rank <r>                     rank that crashes
+    //   --hard_crash_after_seconds <t>            when it crashes
+    //   --hard_crash_recovery_after_seconds <t>   seconds after crash before rejoining
+    //
+    // Graceful shutdown — broadcasts state then permanently leaves:
+    //   --shutdown_rank <r>                       rank that shuts down
+    //   --shutdown_after_seconds <t>              when it shuts down
     //
     // Heartbeat tuning:
-    //   --heartbeat_interval_ms <ms>     ping frequency (default 1000)
-    //   --heartbeat_timeout_ms  <ms>     silence before failure declared (default 5000)
+    //   --heartbeat_interval_ms <ms>              ping frequency (default 1000)
+    //   --heartbeat_timeout_ms  <ms>              silence before failure declared (default 5000)
+    //
+    // Note: TOKEN_TIMEOUT is fixed at 2 × heartbeat_timeout_ms internally to
+    // guarantee PEER_FAILED propagates before the first token regeneration
+    // reaches the dead node's predecessor.
     DropoutConfig dropout_cfg;
-    get_argument(arguments, "--dropout_rank",           false, dropout_cfg.dropout_rank);
-    get_argument(arguments, "--dropout_after_seconds",  false, dropout_cfg.dropout_after_seconds);
-    get_argument(arguments, "--recovery_after_seconds", false, dropout_cfg.recovery_after_seconds);
-    get_argument(arguments, "--shutdown_rank",          false, dropout_cfg.shutdown_rank);
-    get_argument(arguments, "--shutdown_after_seconds", false, dropout_cfg.shutdown_after_seconds);
-    get_argument(arguments, "--heartbeat_interval_ms",  false, dropout_cfg.heartbeat_interval_ms);
-    get_argument(arguments, "--heartbeat_timeout_ms",   false, dropout_cfg.heartbeat_timeout_ms);
+    get_argument(arguments, "--dropout_rank",                       false, dropout_cfg.dropout_rank);
+    get_argument(arguments, "--dropout_after_seconds",              false, dropout_cfg.dropout_after_seconds);
+    get_argument(arguments, "--recovery_after_seconds",             false, dropout_cfg.recovery_after_seconds);
+    get_argument(arguments, "--hard_crash_rank",                    false, dropout_cfg.hard_crash_rank);
+    get_argument(arguments, "--hard_crash_after_seconds",           false, dropout_cfg.hard_crash_after_seconds);
+    get_argument(arguments, "--hard_crash_recovery_after_seconds",  false, dropout_cfg.hard_crash_recovery_after_seconds);
+    get_argument(arguments, "--shutdown_rank",                      false, dropout_cfg.shutdown_rank);
+    get_argument(arguments, "--shutdown_after_seconds",             false, dropout_cfg.shutdown_after_seconds);
+    get_argument(arguments, "--heartbeat_interval_ms",              false, dropout_cfg.heartbeat_interval_ms);
+    get_argument(arguments, "--heartbeat_timeout_ms",               false, dropout_cfg.heartbeat_timeout_ms);
 
     if (rank == 0) {
         if (dropout_cfg.dropout_rank >= 0) {
-            Log::info("[SIM] Unintentional failure: rank %d silent at t=%.1fs, "
+            Log::info("[SIM] Soft dropout: rank %d silent at t=%.1fs, "
                       "recovers after %.1fs\n",
                       dropout_cfg.dropout_rank, dropout_cfg.dropout_after_seconds,
                       dropout_cfg.recovery_after_seconds);
+        }
+        if (dropout_cfg.hard_crash_rank >= 0) {
+            Log::info("[SIM] Hard crash:   rank %d crashes at t=%.1fs, "
+                      "recovers after %.1fs\n",
+                      dropout_cfg.hard_crash_rank, dropout_cfg.hard_crash_after_seconds,
+                      dropout_cfg.hard_crash_recovery_after_seconds);
         }
         if (dropout_cfg.shutdown_rank >= 0) {
             Log::info("[SIM] Graceful shutdown: rank %d permanently leaves at t=%.1fs\n",
