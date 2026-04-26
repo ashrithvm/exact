@@ -12,6 +12,7 @@ __pycache__/*
 visualization/plots/*
 test_output/*
 new_files/*
+.venv/
 
 combined_fitness_log.csv
 fitness_evolution_plot.png
