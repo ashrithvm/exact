@@ -84,6 +84,35 @@ vector<vector<vector<double> > > training_outputs;
 vector<vector<vector<double> > > validation_inputs;
 vector<vector<vector<double> > > validation_outputs;
 
+// Validation baseline for RMSE / R² computation.
+// Computed once in main() from validation_outputs before peer_node() is called.
+// SS_tot = sum of (y - y_mean)^2 over every output value in the validation set.
+// R² = 1 - (MSE * n_val_points) / val_ss_tot
+static double   g_val_ss_tot   = 1.0;   // guarded against div-by-zero
+static int64_t  g_n_val_points = 1;
+
+// Computes the sum-of-squared-deviations (SS_tot) and point count for all
+// values in val_outputs.  Called once at startup so RMSE / R² can be derived
+// from MSE throughout the run without re-loading data.
+static void compute_val_baseline(
+    const vector<vector<vector<double>>>& val_outputs,
+    double& ss_tot_out, int64_t& n_points_out)
+{
+    double  sum = 0.0;
+    int64_t n   = 0;
+    for (const auto& seq  : val_outputs)
+        for (const auto& step : seq)
+            for (double v : step) { sum += v; ++n; }
+    if (n == 0) { ss_tot_out = 1.0; n_points_out = 1; return; }
+    const double mean = sum / static_cast<double>(n);
+    double ss = 0.0;
+    for (const auto& seq  : val_outputs)
+        for (const auto& step : seq)
+            for (double v : step) { double d = v - mean; ss += d * d; }
+    ss_tot_out   = (ss > 0.0) ? ss : 1.0;   // guard: avoid divide-by-zero
+    n_points_out = n;
+}
+
 static uint64_t stable_hash_fnv1a_64(const std::string& s) {
     // Deterministic across peers/ranks: FNV-1a 64-bit.
     uint64_t hash = 14695981039346656037ULL;
@@ -658,6 +687,7 @@ struct FaultToleranceLogger {
         events_file << "wall_time_s,event_type,reporting_rank,subject_rank,"
                     << "active_ranks_count,best_fitness,genomes_evaluated,"
                     << "downtime_s,detail\n";
+        events_file.flush();
 
         summary_file.open(output_dir + "/fault_tolerance_summary.csv");
     }
@@ -734,6 +764,52 @@ struct FaultToleranceLogger {
     }
 };
 
+// =============================================================================
+// TestMetricsLogger
+// Writes test_metrics_log.csv into the rank's output directory.
+// Logged on every genome insertion so it aligns with fitness_log.csv.
+//
+// Columns:
+//   wall_time_s        — seconds since run start
+//   genomes_evaluated  — cumulative genomes inserted (from genome generation_id)
+//   best_mse           — current best validation MSE
+//   rmse               — sqrt(best_mse)
+//   r2                 — 1 - (best_mse * n_val_points) / val_ss_tot
+//
+// R² is computed relative to the validation output distribution, so a value
+// close to 1.0 means the model explains most of the variance in the target.
+// Note: computed on normalized data (same scale as MSE).
+// =============================================================================
+struct TestMetricsLogger {
+    std::ofstream file;
+    std::chrono::steady_clock::time_point start_time;
+
+    void open(const std::string& output_dir,
+              std::chrono::steady_clock::time_point t0) {
+        start_time = t0;
+        file.open(output_dir + "/test_metrics_log.csv");
+        file << "wall_time_s,genomes_evaluated,best_mse,rmse,r2\n";
+        file.flush();
+    }
+
+    void log(int32_t genomes_evaluated, double best_mse) {
+        if (!file.is_open() || best_mse <= 0.0 || best_mse >= 1e6) return;
+        const double wall_time = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time).count();
+        const double rmse = std::sqrt(best_mse);
+        const double r2   = 1.0 - (best_mse * static_cast<double>(g_n_val_points))
+                                  / g_val_ss_tot;
+        file << std::fixed << std::setprecision(6)
+             << wall_time         << ","
+             << genomes_evaluated << ","
+             << best_mse          << ","
+             << rmse               << ","
+             << r2                 << "\n";
+        file.flush();
+    }
+};
+
+
 void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg) {
     // Physical ring (fixed): used for heartbeats and token forwarding.
     // These never skip dropped ranks so the token always completes a full circuit.
@@ -758,6 +834,10 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
     // Open fault-tolerance log files in this rank's output directory.
     FaultToleranceLogger ft_log;
     ft_log.open(examm->get_output_directory(), rank, start_time);
+
+    // Open RMSE / R² time-series log.
+    TestMetricsLogger tm_log;
+    tm_log.open(examm->get_output_directory(), start_time);
 
     // ----- Heartbeat state -----
     // Each rank sends a heartbeat to ring_successor every heartbeat_interval_ms.
@@ -1320,6 +1400,14 @@ void peer_node(int32_t rank, int32_t max_rank, const DropoutConfig& dropout_cfg)
             const bool   inserted           = examm->insert_genome(genome);
             const bool   is_new_global_best = inserted && genome->get_fitness() < prev_best;
 
+            // Log RMSE / R² on every insertion so throughput and convergence
+            // can be derived at the same time resolution as fitness_log.csv.
+            if (inserted) {
+                const int32_t gen_id = (examm->get_best_genome() != nullptr)
+                    ? examm->get_best_genome()->get_generation_id() : 0;
+                tm_log.log(gen_id, examm->get_best_fitness());
+            }
+
             if (is_new_global_best) {
                 const int32_t backup_succ = next_alive_rank(rank, active_ranks);
                 if (backup_succ != rank && pending_outgoing.size() < MAX_PENDING_TRANSFERS) {
@@ -1462,6 +1550,17 @@ int main(int argc, char** argv) {
             Log::info("[SIM] Graceful shutdown: rank %d permanently leaves at t=%.1fs\n",
                       dropout_cfg.shutdown_rank, dropout_cfg.shutdown_after_seconds);
         }
+    }
+
+    // Compute validation baseline (mean, SS_tot) once before the run starts.
+    // Every rank computes the same values independently from local validation data.
+    compute_val_baseline(validation_outputs, g_val_ss_tot, g_n_val_points);
+    if (rank == 0) {
+        Log::info("[METRICS] Validation baseline: %lld points, SS_tot=%.4f, "
+                  "mean_var=%.6f\n",
+                  (long long)g_n_val_points,
+                  g_val_ss_tot,
+                  g_val_ss_tot / static_cast<double>(g_n_val_points));
     }
 
     examm = generate_examm_from_arguments(peer_arguments, time_series_sets, weight_rules, seed_genome);
